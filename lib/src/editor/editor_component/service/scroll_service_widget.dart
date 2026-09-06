@@ -22,6 +22,7 @@ class ScrollServiceWidget extends StatefulWidget {
 }
 
 class _ScrollServiceWidgetState extends State<ScrollServiceWidget>
+    with WidgetsBindingObserver
     implements AppFlowyScrollService {
   final _forwardKey =
       GlobalKey(debugLabel: 'forward_to_platform_scroll_service');
@@ -34,18 +35,40 @@ class _ScrollServiceWidgetState extends State<ScrollServiceWidget>
   late ScrollController scrollController = ScrollController();
 
   Selection? lastSelection;
+  double _lastViewInsetsBottom = 0;
+  int _ensureGeneration = 0;
 
   @override
   void initState() {
     super.initState();
     editorState.selectionNotifier.addListener(_onSelectionChanged);
+    WidgetsBinding.instance.addObserver(this);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     scrollController.dispose();
     editorState.selectionNotifier.removeListener(_onSelectionChanged);
     super.dispose();
+  }
+
+  @override
+  void didChangeMetrics() {
+    if (!PlatformExtension.isMobile) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
+      final keyboardGrew = bottomInset > _lastViewInsetsBottom + 1.0;
+      _lastViewInsetsBottom = bottomInset;
+      if (keyboardGrew) {
+        _ensureSelectionVisible();
+      }
+    });
   }
 
   @override
@@ -176,14 +199,22 @@ class _ScrollServiceWidgetState extends State<ScrollServiceWidget>
           if (_forwardKey.currentContext == null) {
             return;
           }
-          // Mobile needs to continuously update scroll position/direction during drag
-          // Don't skip even if already scrolling, because direction may have changed
-          startAutoScroll(
-            endTouchPoint,
-            edgeOffset: editorState.autoScrollEdgeOffset,
-            direction: direction,
-            duration: scrollDuration,
-          );
+          if (isDragOperation) {
+            // Mobile needs to continuously update scroll position/direction
+            // during drag. Don't skip even if already scrolling, because
+            // direction may have changed.
+            startAutoScroll(
+              endTouchPoint,
+              edgeOffset: editorState.autoScrollEdgeOffset,
+              direction: direction,
+              duration: scrollDuration,
+            );
+            return;
+          }
+          // Edge-dragging only nudges a few pixels per tick and does not
+          // continue after a tap. After the soft keyboard resizes the
+          // viewport, jump the caret fully back into view.
+          _ensureSelectionVisible();
         });
       } else {
         if (_forwardKey.currentContext == null) {
@@ -260,4 +291,172 @@ class _ScrollServiceWidgetState extends State<ScrollServiceWidget>
 
   @override
   void goBallistic(double velocity) => forward.goBallistic(velocity);
+
+  void _ensureSelectionVisible({int attempt = 0}) {
+    if (editorState.disableAutoScroll) {
+      return;
+    }
+    if (attempt == 0) {
+      _ensureGeneration++;
+    }
+    final generation = _ensureGeneration;
+    final selectionRects = editorState.selectionRects();
+    if (selectionRects.isEmpty) {
+      return;
+    }
+    final scrollBox = editorState.renderBox;
+    if (scrollBox == null || !scrollBox.hasSize) {
+      return;
+    }
+
+    final targetRect = selectionRects.last;
+    final localSelection = Rect.fromPoints(
+      scrollBox.globalToLocal(targetRect.topLeft),
+      scrollBox.globalToLocal(targetRect.bottomRight),
+    );
+    final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
+    final edge = editorState.autoScrollEdgeOffset;
+    final bottomEdge = keyboardBottomScrollClearance(
+      edgeOffset: edge,
+      keyboardInset: keyboardInset,
+      keyboardOverlap: keyboardViewportOverlap(
+        viewport: scrollBox,
+        screenSize: MediaQuery.sizeOf(context),
+        keyboardInset: keyboardInset,
+      ),
+    );
+    final delta = computeSelectionVisibleScrollDelta(
+      localSelection: localSelection,
+      viewportSize: scrollBox.size,
+      edgeOffset: edge,
+      bottomEdgeOffset: bottomEdge > 0 ? bottomEdge : edge,
+    );
+    if (delta != null && delta.abs() > 0.5) {
+      final future = _scrollBy(delta, animate: attempt == 0);
+      if (attempt < 2) {
+        future.then((_) {
+          if (!mounted || generation != _ensureGeneration) {
+            return;
+          }
+          _ensureSelectionVisible(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+    // Scroll extent can lag the keyboard inset / footer layout by a frame.
+    if (attempt == 0 && keyboardInset > 0) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || generation != _ensureGeneration) {
+          return;
+        }
+        _ensureSelectionVisible(attempt: 1);
+      });
+    }
+  }
+
+  Future<void> _scrollBy(double delta, {required bool animate}) {
+    final controller = widget.editorScrollController;
+    // Relative to the live scroll position. offsetNotifier can desync after
+    // a keyboard hide/show; jumping to (staleNotifier + delta) looks like a
+    // reset-to-top followed by a second scroll.
+    const duration = Duration(milliseconds: 100);
+    if (controller.shrinkWrap) {
+      if (!controller.scrollController.hasClients) {
+        return Future.value();
+      }
+      final position = controller.scrollController.position;
+      final target = (position.pixels + delta).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      if (!animate) {
+        controller.scrollController.jumpTo(target);
+        return Future.value();
+      }
+      return controller.scrollController.animateTo(
+        target,
+        duration: duration,
+        curve: Curves.easeOut,
+      );
+    }
+    final position = editorState.scrollableState?.position;
+    var clampedDelta = delta;
+    if (position != null) {
+      final target = (position.pixels + delta).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      clampedDelta = target - position.pixels;
+      if (clampedDelta.abs() < 0.5) {
+        return Future.value();
+      }
+    }
+    return controller.scrollOffsetController.animateScroll(
+      offset: clampedDelta,
+      duration: animate ? duration : const Duration(milliseconds: 1),
+      curve: Curves.easeOut,
+    );
+  }
+}
+
+/// Extra list extent below the last line while the IME is visible.
+const double appFlowyEditorKeyboardCaretGap = 32.0;
+
+/// How much of [viewport] sits under the software keyboard, in local px.
+double keyboardViewportOverlap({
+  required RenderBox viewport,
+  required Size screenSize,
+  required double keyboardInset,
+}) {
+  if (keyboardInset <= 0 || !viewport.hasSize) {
+    return 0;
+  }
+  final boxBottom =
+      viewport.localToGlobal(Offset(0, viewport.size.height)).dy;
+  final keyboardTop = screenSize.height - keyboardInset;
+  final covered = boxBottom - keyboardTop;
+  return covered > 0 ? covered : 0;
+}
+
+/// Real bottom spacer height so the last line can sit above the keyboard.
+///
+/// Includes [keyboardOverlap] when the editor viewport is not fully resized
+/// above the IME; a fixed pad cannot substitute for that measured amount.
+double keyboardBottomScrollClearance({
+  required double edgeOffset,
+  required double keyboardInset,
+  double keyboardOverlap = 0,
+}) {
+  if (keyboardInset <= 0) {
+    return 0;
+  }
+  return edgeOffset + appFlowyEditorKeyboardCaretGap + keyboardOverlap;
+}
+
+/// How far to scroll so [localSelection] stays inside the viewport.
+///
+/// [localSelection] is in the scrollable viewport's local coordinates.
+/// Positive scrolls down; negative scrolls up. Returns null if already visible.
+double? computeSelectionVisibleScrollDelta({
+  required Rect localSelection,
+  required Size viewportSize,
+  double edgeOffset = 0,
+  double? bottomEdgeOffset,
+}) {
+  if (viewportSize.height <= 0) {
+    return null;
+  }
+
+  final visibleTop = edgeOffset;
+  final visibleBottom = viewportSize.height - (bottomEdgeOffset ?? edgeOffset);
+  if (visibleBottom <= visibleTop) {
+    return localSelection.center.dy - viewportSize.height / 2;
+  }
+  if (localSelection.bottom > visibleBottom) {
+    return localSelection.bottom - visibleBottom;
+  }
+  if (localSelection.top < visibleTop) {
+    return localSelection.top - visibleTop;
+  }
+  return null;
 }
