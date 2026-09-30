@@ -138,7 +138,8 @@ class _TableColState extends State<TableCol> {
         );
         if (transaction.operations.isNotEmpty) {
           transaction.afterSelection = transaction.beforeSelection;
-          widget.editorState.apply(transaction);
+          widget.editorState.apply(transaction, options: const ApplyOptions(source: TransactionSource.none));
         }
       });
 }
+
